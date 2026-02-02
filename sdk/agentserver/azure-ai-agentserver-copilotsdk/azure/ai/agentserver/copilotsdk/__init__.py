@@ -8,14 +8,14 @@ from typing import TYPE_CHECKING, Callable, Optional
 from ._version import VERSION
 
 if TYPE_CHECKING:  # pragma: no cover
-    pass
+    from .copilotsdk import CopilotSDKAdapter
 
 
 def from_copilot_sdk(
     handler: Callable,
     model: Optional[str] = None,
     system_message: Optional[str] = None,
-):
+) -> "CopilotSDKAdapter":
     """
     Create a CopilotSDKAdapter from a prompt handler function.
 
