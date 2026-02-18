@@ -373,6 +373,587 @@ Copilot SDK  Claude SDK  LangGraph       AgentFramework
 
 ---
 
+## Deep Dive: Input/Output Formats and Conversion
+
+Each adapter converts between the **OpenAI Responses API format** (the "wire format" the server speaks) and its **framework's native format**. Some frameworks have richer native formats than others, which is why the converters vary dramatically in complexity.
+
+### The `/responses` Request/Response Schema
+
+Before looking at each adapter, here's the full schema of what arrives over HTTP and what must be returned.
+
+#### Request Schema (`POST /responses`)
+
+```jsonc
+// CreateResponse — extends OpenAI ResponseCreateParamsBase
+{
+  // ── Input items (the conversation history) ───────────────────
+  "input": [                                      // List[ResponseInputItemParam]
+    {
+      "type": "message",                          // "message" | "function_call" | "function_call_output"
+      "role": "user",                             // "user" | "assistant" | "system"
+      "content": [                                // List[ItemContent]
+        {
+          "type": "input_text",                   // content type (see table below)
+          "text": "What's the weather in Seattle?"
+        }
+      ]
+    },
+    {                                             // Implicit user message (no type/role)
+      "content": "Follow-up question"
+    },
+    {                                             // Function call (from previous turn)
+      "type": "function_call",
+      "call_id": "call_abc123",
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Seattle\"}"
+    },
+    {                                             // Function call result
+      "type": "function_call_output",
+      "call_id": "call_abc123",
+      "output": "{\"temp\": 15, \"condition\": \"cloudy\"}"
+    }
+  ],
+
+  // ── Optional fields ──────────────────────────────────────────
+  "instructions": "You are a weather assistant.",  // System prompt
+  "model": "gpt-4o",
+  "stream": true,                                  // Request streaming
+  "temperature": 0.7,
+  "top_p": 1.0,
+  "tools": [...],                                  // Tool definitions
+  "conversation": {"id": "conv_abc123"},           // Thread ID
+  "agent": {"name": "weather-bot", "type": "agent", "version": "1.0"},
+  "metadata": {"response_id": "resp_abc123"}       // Optional pre-set ID
+}
+```
+
+**Content types** (`ItemContent.type`):
+
+| Input types | Output types |
+|-------------|-------------|
+| `input_text` | `output_text` |
+| `input_image` | `output_audio` |
+| `input_audio` | `refusal` |
+| `input_file` | |
+
+#### Response Schema (Non-Streaming)
+
+```jsonc
+// Response — OpenAI Responses API format
+{
+  "id": "resp_abc123...",
+  "object": "response",
+  "status": "completed",                           // "completed" | "failed" | "in_progress"
+  "created_at": 1739884800,
+  "agent": {"name": "weather-bot", "type": "agent", "version": "1.0"},
+  "conversation": {"id": "conv_abc123..."},
+  "metadata": {},
+  "temperature": 0.7,
+  "top_p": 1.0,
+
+  // ── Output items ─────────────────────────────────────────────
+  "output": [
+    {                                              // Assistant text message
+      "type": "message",
+      "id": "msg_abc123...",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "The weather in Seattle is 15°C and cloudy.",
+          "annotations": []
+        }
+      ]
+    },
+    {                                              // Function call (tool use)
+      "type": "function_call",
+      "id": "func_abc123...",
+      "call_id": "call_xyz789",
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Seattle\"}",
+      "status": "completed"
+    },
+    {                                              // Function result
+      "type": "function_call_output",
+      "id": "funcout_abc123...",
+      "call_id": "call_xyz789",
+      "output": "[{\"type\": \"text\", \"text\": \"15°C, cloudy\"}]",
+      "status": "completed"
+    }
+  ]
+}
+```
+
+#### Response Schema (Streaming SSE)
+
+Each SSE `data:` line carries a `ResponseStreamEvent` object. The full sequence for a text response:
+
+```jsonc
+// 1. Envelope events
+{"type": "response.created", "sequence_number": 1,
+ "response": {"id": "resp_...", "status": "in_progress", "created_at": 1739884800}}
+
+{"type": "response.in_progress", "sequence_number": 2,
+ "response": {"id": "resp_...", "status": "in_progress"}}
+
+// 2. Output item lifecycle
+{"type": "response.output_item.added", "sequence_number": 3,
+ "output_index": 0,
+ "item": {"type": "message", "id": "msg_...", "role": "assistant", "status": "in_progress", "content": []}}
+
+{"type": "response.content_part.added", "sequence_number": 4,
+ "output_index": 0, "content_index": 0,
+ "part": {"type": "output_text", "text": "", "annotations": []}}
+
+// 3. Text deltas (repeated per chunk)
+{"type": "response.output_text.delta", "sequence_number": 5,
+ "output_index": 0, "content_index": 0, "delta": "The weather "}
+
+{"type": "response.output_text.delta", "sequence_number": 6,
+ "output_index": 0, "content_index": 0, "delta": "in Seattle "}
+
+{"type": "response.output_text.delta", "sequence_number": 7,
+ "output_index": 0, "content_index": 0, "delta": "is 15°C and cloudy."}
+
+// 4. Finalization
+{"type": "response.output_text.done", "sequence_number": 8,
+ "output_index": 0, "content_index": 0, "text": "The weather in Seattle is 15°C and cloudy."}
+
+{"type": "response.content_part.done", "sequence_number": 9,
+ "output_index": 0, "content_index": 0,
+ "part": {"type": "output_text", "text": "The weather in Seattle is 15°C and cloudy.", "annotations": []}}
+
+{"type": "response.output_item.done", "sequence_number": 10,
+ "output_index": 0,
+ "item": {"type": "message", "id": "msg_...", "role": "assistant", "status": "completed",
+          "content": [{"type": "output_text", "text": "The weather in Seattle is 15°C and cloudy.", "annotations": []}]}}
+
+{"type": "response.completed", "sequence_number": 11,
+ "response": {"id": "resp_...", "status": "completed"}}
+
+// Terminal marker
+[DONE]
+```
+
+For a **function call** stream, the inner events are different:
+
+```jsonc
+{"type": "response.output_item.added", "output_index": 0,
+ "item": {"type": "function_call", "id": "func_...", "name": "get_weather", "call_id": "call_...", "status": "in_progress"}}
+
+{"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{\"location\":"}
+{"type": "response.function_call_arguments.delta", "output_index": 0, "delta": " \"Seattle\"}"}
+
+{"type": "response.function_call_arguments.done", "output_index": 0,
+ "arguments": "{\"location\": \"Seattle\"}"}
+
+{"type": "response.output_item.done", "output_index": 0,
+ "item": {"type": "function_call", "id": "func_...", "name": "get_weather", "call_id": "call_...",
+          "arguments": "{\"location\": \"Seattle\"}", "status": "completed"}}
+```
+
+---
+
+### Input Conversion: Why Some Are More Complex
+
+The fundamental question each converter answers: **how do you turn an OpenAI `input` array into what the framework expects?**
+
+| Framework | Native input type | Why |
+|-----------|------------------|-----|
+| **AgentFramework** | `ChatMessage(role, text)` or `str` | The framework's `agent.run()` accepts structured chat messages with roles. Close to OpenAI format, so conversion preserves structure. |
+| **LangGraph** | `{"messages": [HumanMessage, AIMessage, ToolMessage, ...]}` | LangGraph operates on a **state dict** with typed LangChain message objects. Richest type system — supports multimodal content (images, audio, files) and tool call/result objects. |
+| **Claude SDK** | `str` (plain text) | Claude Agent SDK's `send()` takes a single string prompt. All message structure must be flattened. |
+| **Copilot SDK** | `str` (role-prefixed text) | Handler functions take a string. Role information is preserved as text prefixes ("User:", "System:"). |
+
+#### AgentFramework Input Converter
+
+Preserves the message structure as `ChatMessage` objects with roles:
+
+```python
+# OpenAI request input:
+[
+    {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "You are helpful."}]},
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+    {"type": "message", "role": "assistant", "content": [{"type": "input_text", "text": "Hi there!"}]},
+]
+
+# After AgentFrameworkInputConverter.transform_input():
+[
+    ChatMessage(role=ChatRole.SYSTEM, text="You are helpful."),
+    ChatMessage(role=ChatRole.USER, text="Hello"),
+    ChatMessage(role=ChatRole.ASSISTANT, text="Hi there!"),
+]
+```
+
+The converter handles three input shapes:
+1. **Implicit user messages**: `{"content": "hello"}` (no type/role) → `"hello"` as string
+2. **Explicit typed messages**: `{"type": "message", "role": "user", "content": [...]}` → `ChatMessage(role, text)`
+3. **Mixed content**: If both strings and ChatMessages exist, falls back to extracting text from ChatMessage
+
+```python
+# Implicit user message:
+{"content": [{"type": "input_text", "text": "hi"}]}
+# → "hi" (plain string)
+
+# Explicit message with role:
+{"type": "message", "role": "assistant", "content": [{"type": "input_text", "text": "hello"}]}
+# → ChatMessage(role=ChatRole.ASSISTANT, text="hello")
+```
+
+#### LangGraph Input Converter
+
+The most complex converter — maps OpenAI types to LangChain's rich message hierarchy and supports multimodal content:
+
+```python
+# OpenAI request input:
+{
+    "instructions": "You are a weather bot.",
+    "input": [
+        {"type": "message", "role": "user",
+         "content": [
+             {"type": "input_text", "text": "What's the weather?"},
+             {"type": "input_image", "url": "https://..."}
+         ]},
+        {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+         "arguments": "{\"location\": \"Seattle\"}"},
+        {"type": "function_call_output", "call_id": "call_1",
+         "output": "15°C, cloudy"},
+    ]
+}
+
+# After LangGraphRequestConverter.convert():
+{
+    "messages": [
+        SystemMessage(content="You are a weather bot."),
+        HumanMessage(content=[
+            {"type": "text", "text": "What's the weather?"},
+            {"type": "image", "url": "https://..."}      # input_image → image
+        ]),
+        AIMessage(content="", tool_calls=[
+            ToolCall(id="call_1", name="get_weather", args={"location": "Seattle"})
+        ]),
+        ToolMessage(content="15°C, cloudy", tool_call_id="call_1"),
+    ]
+}
+```
+
+Key complexity drivers:
+- **Content type remapping**: `input_text` → `text`, `input_image` → `image`, `input_audio` → `audio`, `input_file` → `file`
+- **Function calls** → `AIMessage` with `tool_calls` list (JSON-parsed arguments)
+- **Function results** → `ToolMessage` with `tool_call_id` link
+- **Instructions** become a `SystemMessage` prepended to the list
+
+#### Claude SDK Input Converter
+
+The simplest — everything becomes a single flat string:
+
+```python
+# OpenAI request input:
+[
+    {"type": "message", "role": "system",
+     "content": [{"type": "input_text", "text": "You are helpful."}]},
+    {"type": "message", "role": "user",
+     "content": [{"type": "input_text", "text": "What's the weather?"}]},
+]
+
+# After ClaudeInputConverter.transform_input():
+"You are helpful. What's the weather?"
+```
+
+All message roles are discarded. Multi-part content is joined with spaces. This is because the Claude Agent SDK's `send()` method takes a single string.
+
+#### Copilot SDK Input Converter
+
+Similar simplification, but preserves role information as text prefixes:
+
+```python
+# OpenAI request input:
+{
+    "instructions": "You are a weather bot.",
+    "input": [
+        {"type": "message", "role": "user",
+         "content": [{"type": "input_text", "text": "What's the weather?"}]},
+        {"type": "function_call", "name": "get_weather",
+         "arguments": "{\"location\": \"Seattle\"}"},
+        {"type": "function_call_output", "output": "15°C, cloudy"},
+    ]
+}
+
+# After CopilotSDKRequestConverter.convert():
+"System: You are a weather bot.\nUser: What's the weather?\n[Function Call: get_weather({\"location\": \"Seattle\"})]\n[Function Output: 15°C, cloudy]"
+```
+
+Preserves structure as formatted text — function calls become `[Function Call: name(args)]` and results become `[Function Output: ...]`.
+
+---
+
+### Output Conversion: Why Some Are More Complex
+
+The reverse question: **how do you turn the framework's response into OpenAI output items?**
+
+| Framework | Native output type | Supported output items |
+|-----------|-------------------|----------------------|
+| **AgentFramework** | `AgentRunResponse` with `TextContent`, `FunctionCallContent`, `FunctionResultContent` | `message`, `function_call`, `function_call_output` |
+| **LangGraph** | `AIMessage`, `ToolMessage`, `HumanMessage` with multimodal content | `message` (text, image, audio, file), `function_call`, `function_call_output` |
+| **Claude SDK** | Stream of text chunks (strings or objects with `.content`) | `message` (text only) |
+| **Copilot SDK** | Single string return value | `message` (text only) |
+
+#### AgentFramework Output Converter (Non-Streaming)
+
+Handles three content types, mapping each to a different OpenAI output item:
+
+```python
+# Agent Framework AgentRunResponse with mixed content:
+response.messages = [
+    Message(contents=[TextContent(text="Let me check the weather...")]),
+    Message(contents=[FunctionCallContent(
+        name="get_weather",
+        call_id="call_1",
+        arguments={"location": "Seattle"}
+    )]),
+    Message(contents=[FunctionResultContent(
+        call_id="call_1",
+        result=[TextContent(text="15°C, cloudy")]
+    )]),
+    Message(contents=[TextContent(text="The weather in Seattle is 15°C and cloudy.")]),
+]
+
+# After AgentFrameworkOutputNonStreamingConverter.transform_output_for_response():
+{
+    "id": "resp_...", "object": "response", "status": "completed",
+    "output": [
+        {   # TextContent → message
+            "type": "message", "id": "msg_...", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": "Let me check the weather...", "annotations": []}]
+        },
+        {   # FunctionCallContent → function_call
+            "type": "function_call", "id": "func_...", "status": "completed",
+            "call_id": "call_1", "name": "get_weather",
+            "arguments": "{\"location\": \"Seattle\"}"
+        },
+        {   # FunctionResultContent → function_call_output
+            "type": "function_call_output", "id": "funcout_...", "status": "completed",
+            "call_id": "call_1",
+            "output": "[{\"type\": \"text\", \"text\": \"15°C, cloudy\"}]"
+        },
+        {   # TextContent → message
+            "type": "message", "id": "msg_...", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": "The weather in Seattle is 15°C and cloudy.", "annotations": []}]
+        }
+    ]
+}
+```
+
+The streaming version uses a **state machine** with three states (`_TextContentStreamingState`, `_FunctionCallStreamingState`, `_FunctionCallOutputStreamingState`) that each manage their own buffer and emit the correct SSE event lifecycle.
+
+#### LangGraph Output Converter (Non-Streaming)
+
+Maps LangChain message types to OpenAI output items, including multimodal content:
+
+```python
+# LangGraph output state (list of step dicts):
+[
+    {"agent": {"messages": [
+        AIMessage(content="", tool_calls=[
+            ToolCall(id="call_1", name="get_weather", args={"location": "Seattle"})
+        ])
+    ]}},
+    {"tools": {"messages": [
+        ToolMessage(content="15°C, cloudy", tool_call_id="call_1")
+    ]}},
+    {"agent": {"messages": [
+        AIMessage(content="The weather in Seattle is 15°C and cloudy.")
+    ]}},
+]
+
+# After LangGraphResponseConverter.convert():
+[
+    FunctionToolCallItemResource(                # AIMessage with tool_calls → function_call
+        id="func_...", call_id="call_1",
+        name="get_weather",
+        arguments="{\"location\": \"Seattle\"}",
+        status="completed"
+    ),
+    FunctionToolCallOutputItemResource(          # ToolMessage → function_call_output
+        id="funcout_...", call_id="call_1",
+        output="15°C, cloudy"
+    ),
+    ResponsesAssistantMessageItemResource(       # AIMessage (text) → message
+        id="msg_...", status="completed",
+        content=[ItemContent(type="output_text",
+                             text="The weather in Seattle is 15°C and cloudy.",
+                             annotations=[])]
+    ),
+]
+```
+
+The content type mapping is bidirectional:
+- On **input**: `input_text` → `text`, `input_image` → `image`, `input_audio` → `audio`, `input_file` → `file`
+- On **output**: `text` → `output_text` (assistant) or `input_text` (user), `image` → `input_image` (user only), `audio` → `output_audio` (assistant) or `input_audio` (user)
+
+#### Claude SDK Output Converter (Non-Streaming)
+
+Collects text chunks and builds a single message item:
+
+```python
+# Claude SDK response chunks (from agent.receive_response()):
+[
+    ChunkObject(content="The weather "),
+    ChunkObject(content="in Seattle "),
+    ChunkObject(content="is 15°C and cloudy."),
+]
+
+# After ClaudeOutputNonStreamingConverter.transform_output_for_response():
+{
+    "id": "resp_...", "object": "realtime.response", "status": "completed",
+    "output": [
+        {
+            "type": "message", "id": "msg_...", "status": "completed",
+            "content": [{"type": "output_text",
+                         "text": "The weather in Seattle is 15°C and cloudy.",
+                         "annotations": []}]
+        }
+    ]
+}
+```
+
+Extracts text from chunks via `chunk.content`, `str(chunk)`, or `chunk["content"]` — accommodating different chunk formats. Always produces a single concatenated message.
+
+#### Copilot SDK Output Converter (Non-Streaming)
+
+The simplest — wraps a single string in the response structure:
+
+```python
+# Handler return value:
+"The weather in Seattle is 15°C and cloudy."
+
+# After CopilotSDKResponseConverter.convert():
+{
+    "id": "resp_...", "object": "response", "status": "completed",
+    "output": [
+        {
+            "type": "message", "id": "msg_...", "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "The weather in Seattle is 15°C and cloudy.",
+                "annotations": []
+            }]
+        }
+    ]
+}
+```
+
+---
+
+### Full Conversion Pipeline Example
+
+Here's an end-to-end example showing how a single `/responses` request flows through the **AgentFramework adapter** — from HTTP request to framework call to HTTP response:
+
+```
+Step 1: Client sends POST /responses
+─────────────────────────────────────
+{
+  "instructions": "You are a weather bot.",
+  "input": [
+    {"type": "message", "role": "user",
+     "content": [{"type": "input_text", "text": "What's the weather in Seattle?"}]}
+  ],
+  "stream": false
+}
+
+        │
+        ▼
+
+Step 2: Server parses → AgentRunContext
+───────────────────────────────────────
+context.request = CreateResponse(instructions="You are a weather bot.", input=[...], stream=False)
+context.stream = False
+context.response_id = "resp_Xk9mN2..."
+context.conversation_id = "conv_Jp3qR7..."
+
+        │
+        ▼
+
+Step 3: AgentFrameworkInputConverter.transform_input()
+──────────────────────────────────────────────────────
+Input:  [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What's..."}]}]
+
+Output: ChatMessage(role=ChatRole.USER, text="What's the weather in Seattle?")
+
+        │
+        ▼
+
+Step 4: agent.run(message) — Agent Framework executes
+──────────────────────────────────────────────────────
+The framework calls the LLM, which decides to use the get_weather tool,
+receives the result, and generates a final answer.
+
+Returns: AgentRunResponse(messages=[
+    Message(contents=[FunctionCallContent(name="get_weather", call_id="call_1", arguments={"location": "Seattle"})]),
+    Message(contents=[FunctionResultContent(call_id="call_1", result="15°C, cloudy")]),
+    Message(contents=[TextContent(text="It's 15°C and cloudy in Seattle.")])
+])
+
+        │
+        ▼
+
+Step 5: AgentFrameworkOutputNonStreamingConverter.transform_output_for_response()
+─────────────────────────────────────────────────────────────────────────────────
+Iterates response.messages, dispatches each content type:
+  FunctionCallContent  → {"type": "function_call", "name": "get_weather", "arguments": "{...}", ...}
+  FunctionResultContent → {"type": "function_call_output", "call_id": "call_1", "output": "...", ...}
+  TextContent           → {"type": "message", "role": "assistant", "content": [{"type": "output_text", ...}]}
+
+        │
+        ▼
+
+Step 6: Server sends HTTP response
+───────────────────────────────────
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "id": "resp_Xk9mN2...",
+  "object": "response",
+  "status": "completed",
+  "created_at": 1739884800,
+  "output": [
+    {"type": "function_call", "id": "func_...", "call_id": "call_1",
+     "name": "get_weather", "arguments": "{\"location\": \"Seattle\"}", "status": "completed"},
+    {"type": "function_call_output", "id": "funcout_...", "call_id": "call_1",
+     "output": "[\"15°C, cloudy\"]", "status": "completed"},
+    {"type": "message", "id": "msg_...", "role": "assistant", "status": "completed",
+     "content": [{"type": "output_text", "text": "It's 15°C and cloudy in Seattle.", "annotations": []}]}
+  ]
+}
+```
+
+### Why the Complexity Varies
+
+The converters' complexity is directly proportional to **how much of the OpenAI format the native framework can represent**:
+
+```
+                Least complex                              Most complex
+    ┌──────────────┼──────────────┼──────────────┼──────────────┐
+    │              │              │              │              │
+ Copilot SDK   Claude SDK   AgentFramework    LangGraph
+ (str → str)   (str → str)  (ChatMessage     (LangChain msgs
+                              + 3 content      + multimodal
+                              types)           + state dict
+                                               + content types)
+```
+
+1. **Copilot SDK**: Input is a string, output is a string. Converters just add/remove JSON wrapping. ~50 lines of conversion logic.
+
+2. **Claude SDK**: Input is a string (all structure lost), output is concatenated text chunks. Converters flatten on input and collect on output. ~100 lines.
+
+3. **AgentFramework**: Input preserves roles as `ChatMessage` objects. Output handles 3 content types (`TextContent`, `FunctionCallContent`, `FunctionResultContent`). Streaming uses 3 state machines. ~950 lines total.
+
+4. **LangGraph**: Input maps to typed LangChain messages with multimodal content and tool calls. Output reverse-maps all message types plus handles bidirectional content type mapping (input_text↔text, input_image↔image, etc.). State converter abstraction adds another layer. ~500+ lines total across converters.
+
+---
+
 ---
 
 ## The Contract Between Agent Code and Azure AI Agent Server
