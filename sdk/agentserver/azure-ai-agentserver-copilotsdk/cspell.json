@@ -1,0 +1,14 @@
+{
+    "ignoreWords": [
+      "azureai",
+      "fstring",
+      "copilot",
+      "copilotsdk"
+    ],
+    "ignorePaths": [
+      "*.csv",
+      "*.json",
+      "*.rst",
+      "**/samples/**"
+    ]
+  }
